@@ -117,6 +117,7 @@
   var resignTimer = null;
 
   var hinting = false;    /* a hint request is in flight (board stays live) */
+  var hintPly = 0;        /* history length when the pending hint was requested */
   var hintMove = null;    /* { from, to } squares highlighted as a hint */
   var resignArmed = false;
 
@@ -468,6 +469,7 @@
     keys.push(C.positionKey(state));
     hashes.push(C.positionHash(state));
     sans.push(san);
+    if (hinting) cancelEngine();
     hinting = false;   /* a played move voids any in-flight hint request */
     hintMove = null;   /* a played move consumes any shown hint */
     lastMove = { from: move.from, to: move.to };
@@ -495,6 +497,15 @@
     var worker = ensureWorker();
     if (!worker) {
       /* no Worker here (notably file:// in some browsers): think inline */
+      aiTimer = setTimeout(function () {
+        aiTimer = null;
+        onCpuMove(C.chooseMove(state, level, hashes.slice()));
+      }, AI_THINK);
+      return;
+    }
+    cancelEngine();
+    worker = ensureWorker();
+    if (!worker) {
       aiTimer = setTimeout(function () {
         aiTimer = null;
         onCpuMove(C.chooseMove(state, level, hashes.slice()));
@@ -540,6 +551,18 @@
   var aiPending = 0;   /* seq we are waiting for; 0 = none outstanding */
   var aiKind = null;   /* 'play' | 'hint' — what the pending reply is for */
 
+  /* Drop whatever the engine is working on. Terminating the Worker frees the
+     CPU at once (a stale search would otherwise delay the next answer by up
+     to its whole budget); ensureWorker() makes a fresh one on demand. */
+  function cancelEngine() {
+    if (aiPending && aiWorker) {
+      try { aiWorker.terminate(); } catch (err) { /* ignore */ }
+      aiWorker = null;
+    }
+    aiPending = 0;
+    aiKind = null;
+  }
+
   function ensureWorker() {
     if (aiWorker || typeof window.Worker !== 'function') return aiWorker;
     try {
@@ -578,6 +601,7 @@
   function requestHint() {
     if (!inputAllowed() || hinting) return;
     hintMove = null;
+    hintPly = history.length;
     var worker = ensureWorker();
     if (!worker) {
       /* hints always search at full strength, never at the game level
@@ -603,6 +627,8 @@
      position may have moved on — re-validate and drop anything stale. */
   function onHintMove(move) {
     hinting = false;
+    /* a move was played (or undone) since the request: the hint was for another position */
+    if (hintPly !== history.length) { render(); return; }
     if (!move || over || !humanTurn()) { render(); return; }
     var canonical = null;
     var legal = statusNow.moves;
@@ -724,8 +750,7 @@
     clearTimeout(endTimer);
     aiTimer = null;
     endTimer = null;
-    aiPending = 0;   /* any in-flight worker answer is now stale */
-    aiKind = null;
+    cancelEngine();  /* any in-flight worker answer is now stale */
     hinting = false;
     hintMove = null;
     clearTimeout(hintTimer);
@@ -783,8 +808,15 @@
     if (isCpuTurn()) scheduleCpu();
   }
 
+  /* restarting throws away a game in progress, so ask first */
+  function confirmReset() {
+    if (over || !history.length) return true;
+    return window.confirm('進行中の対局は破棄されます。よろしいですか？');
+  }
+
   function setMode(next) {
     if (next === mode) return;
+    if (!confirmReset()) return;
     mode = next;
     saveSettings();
     el.modes.forEach(function (btn) {
@@ -965,13 +997,14 @@
   });
 
   el.level.addEventListener('change', function () {
+    /* the level only affects the CPU's next search, so no restart is needed */
     level = el.level.value;
     saveSettings();
-    newGame();
     showToast('難易度：' + el.level.options[el.level.selectedIndex].text);
   });
 
   el.side.addEventListener('change', function () {
+    if (!confirmReset()) { el.side.value = String(humanSide); return; }
     humanSide = Number(el.side.value);
     saveSettings();
     newGame();
