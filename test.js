@@ -489,5 +489,24 @@ console.log('\n[full games]');
   console.log('  endings: ' + JSON.stringify(reasons));
 }
 
+console.log('\n[coach: chooseScored / scoreMove]');
+{
+  // a free queen: the best move must win it, and grading must agree
+  const s = C.fromFen('4k3/8/8/3q4/8/8/8/3QK3 w - - 0 1');
+  const r = C.chooseScored(s, 'hard', []);
+  check('chooseScored returns move, score and depth', r && r.move && typeof r.score === 'number' && r.depth >= 1, r);
+  check('chooseScored picks the same move class as chooseMove (captures the queen)', r.move.to === C.squareIndex('d5'), r.move);
+  const lm = C.legalMoves(s);
+  const best = lm.find(m => m.to === C.squareIndex('d5'));
+  const quiet = lm.find(m => m.piece && C.typeOf(m.piece) === C.KING && !m.captured);
+  const sb = C.scoreMove(s, best, r.depth, [], 3000);
+  const sq = C.scoreMove(s, quiet, r.depth, [], 3000);
+  check('scoreMove: winning the queen scores higher than a king shuffle', typeof sb === 'number' && typeof sq === 'number' && sb > sq + 300, { sb, sq });
+  check('scoreMove of the best move is close to the search score', Math.abs(sb - r.score) <= 60, { sb, score: r.score });
+  const forced = C.fromFen('k7/8/1K6/8/8/8/8/7R b - - 0 1');
+  const rf = C.chooseScored(forced, 'hard', []);
+  check('forced single move reports no score', rf.score === null && rf.depth === 0, rf);
+}
+
 console.log(failures === 0 ? '\nALL TESTS PASSED' : '\n' + failures + ' FAILURE(S)');
 process.exit(failures ? 1 : 0);

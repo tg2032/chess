@@ -24,6 +24,11 @@
     sideWrap: document.getElementById('sideWrap'),
     undo: document.getElementById('undoBtn'),
     hint: document.getElementById('hintBtn'),
+    coach: document.getElementById('coachChk'),
+    coachWrap: document.getElementById('coachWrap'),
+    coachBox: document.getElementById('coachBox'),
+    coachRec: document.getElementById('coachRec'),
+    coachEval: document.getElementById('coachEval'),
     resign: document.getElementById('resignBtn'),
     fresh: document.getElementById('newBtn'),
     modes: [].slice.call(document.querySelectorAll('[data-mode]')),
@@ -121,6 +126,11 @@
   var hintMove = null;    /* { from, to } squares highlighted as a hint */
   var resignArmed = false;
 
+  var coachOn = false;    /* 指南モード: recommend a move and grade the one played */
+  var hintAuto = false;   /* the pending hint request was started by the coach */
+  var bestInfo = null;    /* { ply, from, to, promo, score, depth, san } for the current position */
+  var evaluating = false; /* the coach is grading the move just played */
+
   function colorName(color) { return color === WHITE ? '白' : '黒'; }
 
   function playerName(color) {
@@ -149,13 +159,14 @@
       if (d.level === 'easy' || d.level === 'normal' || d.level === 'hard') level = d.level;
       if (d.side === 0 || d.side === 1) humanSide = Number(d.side);
       if (typeof d.sound === 'boolean') soundOn = d.sound;
+      if (typeof d.coach === 'boolean') coachOn = d.coach;
     } catch (e) { /* private mode etc: just play with defaults */ }
   }
 
   function saveSettings() {
     try {
       window.localStorage.setItem(SETTINGS_KEY, JSON.stringify({
-        mode: mode, level: level, side: humanSide, sound: soundOn
+        mode: mode, level: level, side: humanSide, sound: soundOn, coach: coachOn
       }));
     } catch (e) { /* ignore */ }
   }
@@ -168,6 +179,7 @@
     el.side.value = String(humanSide);
     el.levelWrap.hidden = mode !== 'ai';
     el.sideWrap.hidden = mode !== 'ai';
+    syncCoachUI();
     el.sound.textContent = soundOn ? '🔊' : '🔇';
     el.sound.classList.toggle('off', !soundOn);
     el.sound.setAttribute('aria-pressed', String(soundOn));
@@ -228,6 +240,7 @@
   function updateStatus() {
     var text;
     if (over) text = '対局終了';
+    else if (evaluating) text = 'あなたの手を評価中…';
     else if (thinking) text = 'CPUが考え中…';
     else text = playerName(state.turn) + 'の番';
 
@@ -238,7 +251,7 @@
        the in-flight worker reply, so a stale answer can never land */
     el.undo.disabled = history.length === 0;
     el.hint.disabled = !inputAllowed() || hinting;
-    el.hint.textContent = hinting ? '…' : 'ヒント';
+    el.hint.textContent = hinting && !hintAuto ? '…' : 'ヒント';
     el.resign.disabled = over;
   }
 
@@ -462,6 +475,14 @@
 
   function applyMove(move) {
     var san = C.moveToSan(state, move, statusNow.moves);
+    /* what the coach needs to grade this move, taken before the board changes */
+    var pre = null;
+    if (coachActive() && state.turn === humanSide) {
+      pre = {
+        fen: C.toFen(state), hashes: hashes.slice(), move: move, san: san,
+        best: bestInfo && bestInfo.ply === history.length ? bestInfo : null
+      };
+    }
     history.push({ state: state, san: san, prevMove: lastMove });
 
     var wasCapture = !!move.captured;
@@ -471,7 +492,10 @@
     sans.push(san);
     if (hinting) cancelEngine();
     hinting = false;   /* a played move voids any in-flight hint request */
+    hintAuto = false;
     hintMove = null;   /* a played move consumes any shown hint */
+    bestInfo = null;
+    coachRecText('');
     lastMove = { from: move.from, to: move.to };
     selected = -1;
 
@@ -485,7 +509,9 @@
       endTimer = setTimeout(endGame, 480);
       return;
     }
+    if (pre) { coachGrade(pre); return; }
     if (isCpuTurn()) scheduleCpu();
+    else coachKick();
   }
 
   function scheduleCpu() {
@@ -573,11 +599,12 @@
     }
     aiWorker.onmessage = function (e) {
       var d = e.data || {};
-      if (d.type !== 'move' || d.seq !== aiPending) return;   /* stale */
+      if ((d.type !== 'move' && d.type !== 'score') || d.seq !== aiPending) return;   /* stale */
       var kind = aiKind;
       aiPending = 0;
       aiKind = null;
-      if (kind === 'hint') onHintMove(d.move);
+      if (kind === 'hint') onHintMove(d.move, d);
+      else if (kind === 'eval') onCoachScore(d.score);
       else onCpuMove(d.move);
     };
     aiWorker.onerror = function () {
@@ -588,8 +615,10 @@
         var kind = aiKind;
         aiPending = 0;
         aiKind = null;
-        var fallback = C.chooseMove(state, kind === 'hint' ? 'hard' : level, hashes.slice());
-        if (kind === 'hint') onHintMove(fallback);
+        if (kind === 'eval') { onCoachScore(null); return; }
+        var fb = C.chooseScored(state, kind === 'hint' ? 'hard' : level, hashes.slice());
+        var fallback = fb ? fb.move : null;
+        if (kind === 'hint') onHintMove(fallback, fb);
         else onCpuMove(fallback);
       }
     };
@@ -598,15 +627,22 @@
 
   /* ---------- hint ---------- */
 
-  function requestHint() {
+  function requestHint(auto) {
     if (!inputAllowed() || hinting) return;
+    /* the coach may already know the best move: just show it */
+    if (auto !== true && bestInfo && bestInfo.ply === history.length) {
+      showHintMove(bestInfo);
+      return;
+    }
+    hintAuto = auto === true;
     hintMove = null;
     hintPly = history.length;
     var worker = ensureWorker();
     if (!worker) {
       /* hints always search at full strength, never at the game level
          (on easy a hint could otherwise be one of the random moves) */
-      onHintMove(C.chooseMove(state, 'hard', hashes.slice()));
+      var r = C.chooseScored(state, 'hard', hashes.slice());
+      onHintMove(r ? r.move : null, r);
       return;
     }
     hinting = true;
@@ -625,7 +661,7 @@
 
   /* A hint arrived. The board stayed interactive while it computed, so the
      position may have moved on — re-validate and drop anything stale. */
-  function onHintMove(move) {
+  function onHintMove(move, info) {
     hinting = false;
     /* a move was played (or undone) since the request: the hint was for another position */
     if (hintPly !== history.length) { render(); return; }
@@ -640,16 +676,196 @@
       }
     }
     if (!canonical) { render(); return; }
-    hintMove = { from: canonical.from, to: canonical.to };
+    var san = C.moveToSan(state, canonical, statusNow.moves);
+    bestInfo = {
+      ply: history.length, from: canonical.from, to: canonical.to, promo: canonical.promo,
+      score: info && typeof info.score === 'number' ? info.score : null,
+      depth: info && info.depth ? info.depth : 0,
+      san: san
+    };
+    if (coachActive()) coachRecText(coachRecommendation(bestInfo, canonical), 'rec');
+    if (hintAuto) {
+      hintAuto = false;
+      /* the coach keeps the suggestion on the board until a move is played */
+      hintMove = { from: canonical.from, to: canonical.to };
+      render();
+      return;
+    }
+    showHintMove(bestInfo);
+  }
+
+  function showHintMove(info) {
+    hintMove = { from: info.from, to: info.to };
     clearTimeout(hintTimer);
-    hintTimer = setTimeout(function () {
+    hintTimer = coachActive() ? null : setTimeout(function () {
       hintTimer = null;
       hintMove = null;
       render();
     }, 4000);
     render();
-    showToast('ヒント：' + C.moveToSan(state, canonical, statusNow.moves));
+    showToast('ヒント：' + info.san);
     beep('select');
+  }
+
+  /* ---------- 指南モード (coach) ---------- */
+
+  function coachActive() { return coachOn && mode === 'ai'; }
+
+  function syncCoachUI() {
+    el.coachWrap.hidden = mode !== 'ai';
+    el.coach.checked = coachOn;
+    el.coachBox.hidden = !coachActive();
+  }
+
+  function coachRecText(text, cls) {
+    el.coachRec.textContent = text;
+    el.coachRec.className = 'coach-line' + (cls ? ' ' + cls : '');
+  }
+
+  function coachEvalText(text, cls) {
+    el.coachEval.textContent = text;
+    el.coachEval.className = 'coach-line' + (cls ? ' ' + cls : '');
+  }
+
+  function pawns(cp) {
+    var v = Math.round(cp / 10) / 10;
+    return (v > 0 ? '+' : '') + v.toFixed(1);
+  }
+
+  /* "おすすめ: Nf3（…）" — the SAN plus a plain-language note on what the move does */
+  function coachRecommendation(info, move) {
+    var notes = [];
+    var san = info.san;
+    if (san.indexOf('#') >= 0) notes.push('チェックメイト！');
+    else if (san.indexOf('+') >= 0) notes.push('チェックになります');
+    if (san.indexOf('O-O') === 0) notes.push('キャスリング');
+    if (move && move.captured) notes.push('駒を取れます');
+    if (san.indexOf('=') >= 0) notes.push('プロモーション');
+    var t = 'おすすめ：' + san;
+    if (notes.length) t += '（' + notes.join('・') + '）';
+    if (info.score !== null && Math.abs(info.score) < C.MATE - 100) {
+      t += ' ／ 形勢 ' + pawns(info.score);
+    } else if (info.score !== null && info.score >= C.MATE - 100) {
+      t += ' ／ 詰みを狙えます';
+    }
+    return t;
+  }
+
+  function coachKick() {
+    if (!coachActive() || !inputAllowed() || hinting) return;
+    if (bestInfo && bestInfo.ply === history.length) return;
+    if (!statusNow.moves.length) return;
+    coachRecText('おすすめの手を考え中…', 'busy');
+    requestHint(true);
+  }
+
+  /* judge a move by how much worse than the best one it scores (centipawns) */
+  function coachJudge(best, mv, bestSan, playedSan) {
+    var MATE = C.MATE;
+    var cl = function (x) { return Math.max(-1500, Math.min(1500, x)); };
+    var loss = cl(best) - cl(mv);
+    var tail = '（ベストは ' + bestSan + '、約' + (Math.max(0, loss) / 100).toFixed(1) + 'ポーン分の差）';
+    if (mv <= -(MATE - 100) && best > -(MATE - 100)) {
+      return { t: '✕ 大悪手：' + playedSan + ' はチェックメイトされてしまいます。' + tail, c: 'bad' };
+    }
+    if (best >= MATE - 100 && mv < MATE - 100) {
+      return { t: '△ 詰みを逃しました。ベストは ' + bestSan + ' でした。', c: 'warn' };
+    }
+    if (loss <= 15) return { t: '✓ 好手です！ ' + playedSan + ' はほぼ最善です。', c: 'good' };
+    if (loss <= 60) return { t: '○ 悪くない手です：' + playedSan + tail, c: 'good' };
+    if (loss <= 150) return { t: '△ 少し損な手です：' + playedSan + tail, c: 'warn' };
+    if (loss <= 350) return { t: '？ 疑問手です：' + playedSan + tail, c: 'warn' };
+    return { t: '✕ 悪手です：' + playedSan + tail, c: 'bad' };
+  }
+
+  var evalPly = 0;   /* history length the pending evaluation belongs to */
+  var evalCtx = null;
+
+  /* the human just moved (the board already shows it): grade it, then let the CPU answer */
+  function coachGrade(pre) {
+    var m = pre.move;
+    var best = pre.best;
+    var resume = function () {
+      evaluating = false;
+      evalCtx = null;
+      updateStatus();
+      if (isCpuTurn() && !over) scheduleCpu();
+    };
+    if (over) { resume(); return; }
+    if (!best) {
+      coachEvalText('（解析が間に合わなかったため、この手は評価していません）');
+      resume();
+      return;
+    }
+    if (best.from === m.from && best.to === m.to && best.promo === m.promo) {
+      coachEvalText('✓ 最善手です！ ' + pre.san, 'good');
+      resume();
+      return;
+    }
+    if (best.score === null) { coachEvalText(''); resume(); return; }
+
+    evaluating = true;
+    evalPly = history.length;
+    evalCtx = { pre: pre, resume: resume };
+    coachEvalText('あなたの手を評価中…', 'busy');
+    updateStatus();
+
+    var worker = ensureWorker();
+    if (worker) {
+      cancelEngine();
+      worker = ensureWorker();
+    }
+    if (!worker) {
+      setTimeout(function () {
+        if (!evalCtx || evalPly !== history.length) return;
+        var st = C.fromFen(pre.fen);
+        var mv = null;
+        var ls = C.legalMoves(st);
+        for (var i = 0; i < ls.length; i++) {
+          if (ls[i].from === m.from && ls[i].to === m.to && ls[i].promo === m.promo) { mv = ls[i]; break; }
+        }
+        onCoachScore(mv ? C.scoreMove(st, mv, best.depth, pre.hashes, 1200) : null);
+      }, 30);
+      return;
+    }
+    aiPending = ++aiSeq;
+    aiKind = 'eval';
+    worker.postMessage({
+      type: 'score', seq: aiPending, fen: pre.fen,
+      from: m.from, to: m.to, promo: m.promo,
+      depth: best.depth, history: pre.hashes, budget: 1200
+    });
+  }
+
+  function onCoachScore(score) {
+    var ctx = evalCtx;
+    if (!ctx || evalPly !== history.length) return;   /* undone / new game meanwhile */
+    var pre = ctx.pre;
+    if (typeof score !== 'number') {
+      coachEvalText('（評価できませんでした）');
+    } else {
+      var j = coachJudge(pre.best.score, score, pre.best.san, pre.san);
+      coachEvalText(j.t, j.c);
+    }
+    ctx.resume();
+  }
+
+  function setCoach(on) {
+    coachOn = on;
+    saveSettings();
+    syncCoachUI();
+    if (!coachActive()) {
+      if (hintAuto) { cancelEngine(); hinting = false; hintAuto = false; }
+      if (!hinting) hintMove = null;
+      bestInfo = null;
+      coachRecText('');
+      coachEvalText('');
+      render();
+      return;
+    }
+    coachRecText('');
+    coachEvalText('');
+    coachKick();
   }
 
   /* ---------- resign ---------- */
@@ -752,6 +968,11 @@
     endTimer = null;
     cancelEngine();  /* any in-flight worker answer is now stale */
     hinting = false;
+    hintAuto = false;
+    evaluating = false;
+    evalCtx = null;
+    bestInfo = null;
+    coachRecText('');
     hintMove = null;
     clearTimeout(hintTimer);
     hintTimer = null;
@@ -775,9 +996,11 @@
 
     flipped = (mode === 'ai' && humanSide === BLACK);
 
+    coachEvalText('');
     refresh();
     render();
     if (isCpuTurn()) scheduleCpu();
+    else coachKick();
   }
 
   function restoreLast() {
@@ -803,9 +1026,11 @@
     while (mode === 'ai' && history.length && state.turn !== humanSide) restoreLast();
 
     selected = -1;
+    coachEvalText('');
     refresh();
     render();
     if (isCpuTurn()) scheduleCpu();
+    else coachKick();
   }
 
   /* restarting throws away a game in progress, so ask first */
@@ -824,6 +1049,7 @@
     });
     el.levelWrap.hidden = mode !== 'ai';
     el.sideWrap.hidden = mode !== 'ai';
+    syncCoachUI();
     newGame();
     showToast(mode === 'ai' ? 'CPU戦を開始' : '2人対戦を開始');
   }
@@ -987,7 +1213,8 @@
   buildCells();
 
   el.undo.addEventListener('click', undo);
-  el.hint.addEventListener('click', requestHint);
+  el.hint.addEventListener('click', function () { requestHint(); });
+  el.coach.addEventListener('change', function () { setCoach(el.coach.checked); });
   el.resign.addEventListener('click', resign);
   el.fresh.addEventListener('click', newGame);
   el.again.addEventListener('click', newGame);

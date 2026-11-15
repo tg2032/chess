@@ -78,10 +78,21 @@
           </select>
         </label>
 
+        <label class="check-wrap" id="coachWrap">
+          <input type="checkbox" id="coachChk">
+          <span>指南モード（おすすめ手と評価）</span>
+        </label>
+
         <button type="button" class="btn" id="undoBtn" disabled>戻る</button>
         <button type="button" class="btn" id="hintBtn">ヒント</button>
         <button type="button" class="btn" id="resignBtn">投了</button>
         <button type="button" class="btn btn-primary" id="newBtn">新しいゲーム</button>
+      </section>
+
+      <section class="coach" id="coachBox" aria-label="指南" hidden>
+        <div class="coach-head">指南</div>
+        <div class="coach-line" id="coachRec" role="status" aria-live="polite"></div>
+        <div class="coach-line" id="coachEval" role="status" aria-live="polite"></div>
       </section>
 
       <p class="footnote" id="footnote"></p>

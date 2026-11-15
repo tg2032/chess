@@ -2,7 +2,7 @@
    the cache so the game keeps working offline. Bump CACHE to force an update. */
 'use strict';
 
-var CACHE = 'chess-v1';
+var CACHE = 'chess-v2';
 var ASSETS = [
   './',
   './index.html',

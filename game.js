@@ -922,13 +922,22 @@
   /* history: position hashes of the game so far (the current position is
      added automatically). Used to value repetition inside the search. */
   function chooseMove(state, level, history) {
+    var r = chooseScored(state, level, history);
+    return r ? r.move : null;
+  }
+
+  /* Same search as chooseMove, but also reports what the coach needs:
+     score  - the chosen line's value for the side to move (null when the
+              move was forced or random, i.e. nothing was searched)
+     depth  - the last fully searched iteration (0 when nothing was searched) */
+  function chooseScored(state, level, history) {
     var cfg = LEVELS[level] || LEVELS.normal;
     var pairs = legalPairs(state);
     if (pairs.length === 0) return null;
-    if (pairs.length === 1) return pairs[0].m;
+    if (pairs.length === 1) return { move: pairs[0].m, score: null, depth: 0 };
 
     if (cfg.random > 0 && Math.random() < cfg.random) {
-      return pairs[(Math.random() * pairs.length) | 0].m;
+      return { move: pairs[(Math.random() * pairs.length) | 0].m, score: null, depth: 0 };
     }
 
     positionHash(state);
@@ -947,6 +956,7 @@
        so there is always a fallback answer */
     var totalDeadline = Date.now() + cfg.budget;
     var results = null;
+    var doneDepth = 0;
     var i, score;
 
     /* contempt: when clearly ahead a draw is bad news, when clearly behind
@@ -1003,6 +1013,7 @@
       }
 
       results = iteration;
+      doneDepth = depth;
       if (Math.abs(localBest) >= MATE - 100) break;   /* forced mate found */
 
       ctx.draw = localBest > 150 ? -cfg.contempt : (localBest < -150 ? cfg.contempt : 0);
@@ -1013,12 +1024,32 @@
       });
     }
 
-    if (!results) return pairs[0].m;
+    if (!results) return { move: pairs[0].m, score: null, depth: 0 };
 
     results.sort(function (a, b) { return b.score - a.score; });
     var top = results[0].score;
     var pool = results.filter(function (r) { return r.score >= top - cfg.slack; });
-    return pool[(Math.random() * pool.length) | 0].m;
+    return { move: pool[(Math.random() * pool.length) | 0].m, score: top, depth: doneDepth };
+  }
+
+  /* Value of `move` for the side that plays it, searched to the given depth
+     (the coach passes the depth chooseScored reached, so the two numbers are
+     comparable). null when the budget ran out before the search finished. */
+  function scoreMove(state, move, depth, history, budget) {
+    positionHash(state);
+    var child = makeMove(state, move);
+    positionHash(child);
+    var ctx = {
+      nodes: 0, deadline: Date.now() + (budget || 1500), aborted: false,
+      draw: 0,
+      seen: new Set(history || []),
+      path: [],
+      killers: new Int32Array(256).fill(-1),
+      heur: new Int32Array(4096)
+    };
+    ctx.seen.add(state.hash);
+    var v = -search(child, Math.max(0, depth - 1), -Infinity, Infinity, 1, ctx);
+    return ctx.aborted ? null : v;
   }
 
   function scoreOf(iteration, m) {
@@ -1070,6 +1101,9 @@
     captured: captured,
     evaluate: evaluate,
     chooseMove: chooseMove,
+    chooseScored: chooseScored,
+    scoreMove: scoreMove,
+    MATE: MATE,
     levelConfig: levelConfig,
     configureLevel: configureLevel,
     perft: perft
@@ -1080,12 +1114,27 @@
   if (typeof importScripts === 'function' && typeof self !== 'undefined') {
     self.onmessage = function (e) {
       var d = e.data || {};
+      if (d.type === 'score') {
+        var sc = null;
+        try {
+          var st = fromFen(d.fen);
+          var mv = null;
+          var ls = legalMoves(st);
+          for (var li = 0; li < ls.length; li++) {
+            if (ls[li].from === d.from && ls[li].to === d.to && ls[li].promo === d.promo) { mv = ls[li]; break; }
+          }
+          if (mv) sc = scoreMove(st, mv, d.depth, d.history, d.budget);
+        } catch (err) { sc = null; }
+        self.postMessage({ type: 'score', seq: d.seq, kind: 'eval', score: sc });
+        return;
+      }
       if (d.type !== 'move') return;
-      var move = null;
+      var move = null, score = null, depthDone = 0;
       try {
-        move = chooseMove(fromFen(d.fen), d.level, d.history);
+        var r = chooseScored(fromFen(d.fen), d.level, d.history);
+        if (r) { move = r.move; score = r.score; depthDone = r.depth; }
       } catch (err) { move = null; }
-      self.postMessage({ type: 'move', seq: d.seq, kind: d.kind, move: move });
+      self.postMessage({ type: 'move', seq: d.seq, kind: d.kind, move: move, score: score, depth: depthDone });
     };
   }
 

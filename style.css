@@ -679,3 +679,16 @@ select:disabled { opacity: 0.4; cursor: not-allowed; }
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ---------- 指南モード ---------- */
+.check-wrap { display: flex; align-items: center; gap: 8px; font-size: 14px; cursor: pointer; flex-basis: 100%; }
+.check-wrap input { width: 18px; height: 18px; margin: 0; }
+.check-wrap[hidden], .coach[hidden] { display: none; }
+.coach { padding: 10px 12px; border-radius: 10px; background: rgba(90, 150, 255, 0.10); border: 1px solid rgba(90, 150, 255, 0.35); }
+.coach-head { font-size: 12px; opacity: .7; margin-bottom: 4px; }
+.coach-line { font-size: 14px; line-height: 1.55; min-height: 1.4em; word-break: break-all; }
+.coach-line.rec { color: #9cc4ff; font-weight: 700; }
+.coach-line.busy { opacity: .65; }
+.coach-line.good { color: #8fe3a0; }
+.coach-line.warn { color: #e6b95a; }
+.coach-line.bad { color: #ff9d8f; }
