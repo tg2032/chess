@@ -440,10 +440,25 @@
 
   /* ---------- position helpers ---------- */
 
+  /* The ep square only makes two positions differ when a pawn of the side to
+     move actually stands next to it — otherwise the position right after a
+     double push would never match its later repeats (threefold came late). */
+  function epCapturable(state) {
+    var ep = state.ep;
+    if (ep < 0) return false;
+    var from = state.turn === WHITE ? ep + 8 : ep - 8;
+    if (from < 0 || from > 63) return false;
+    var mine = piece(PAWN, state.turn);
+    var f = ep & 7;
+    return (f > 0 && state.board[from - 1] === mine) ||
+           (f < 7 && state.board[from + 1] === mine);
+  }
+
   function positionKey(state) {
     var s = '';
     for (var i = 0; i < 64; i++) s += state.board[i];
-    return s + '|' + state.turn + '|' + state.castling + '|' + state.ep;
+    return s + '|' + state.turn + '|' + state.castling + '|' +
+      (epCapturable(state) ? state.ep : -1);
   }
 
   function computeHash(state) {
@@ -882,8 +897,9 @@
       var score;
       if (child.length === 0) {
         /* nobody can move: a capture just delivered mate (wonderful for the
-           mover) or it is stalemate (a draw, scored with the contempt) */
-        score = inCheck(s, s.turn) ? (MATE - ply - 1) : drawScore(ctx, ply + 1);
+           mover) or it is stalemate (a draw, scored with the contempt — from
+           the mover's side, i.e. this ply, like every other score here) */
+        score = inCheck(s, s.turn) ? (MATE - ply - 1) : drawScore(ctx, ply);
       } else {
         score = -quiesce(s, child, inCheck(s, s.turn), -beta, -alpha, ply + 1, qply + 1, ctx);
       }
@@ -932,6 +948,10 @@
      depth  - the last fully searched iteration (0 when nothing was searched) */
   function chooseScored(state, level, history) {
     var cfg = LEVELS[level] || LEVELS.normal;
+    /* hash the root BEFORE generating children: makeMove only carries a hash
+       forward when the parent has one, and a state fresh from fromFen (the
+       Worker path) has none — without this the search never sees repetition */
+    positionHash(state);
     var pairs = legalPairs(state);
     if (pairs.length === 0) return null;
     if (pairs.length === 1) return { move: pairs[0].m, score: null, depth: 0 };
@@ -939,8 +959,6 @@
     if (cfg.random > 0 && Math.random() < cfg.random) {
       return { move: pairs[(Math.random() * pairs.length) | 0].m, score: null, depth: 0 };
     }
-
-    positionHash(state);
 
     var ctx = {
       nodes: 0, deadline: 0, aborted: false,

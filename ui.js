@@ -97,7 +97,7 @@
 
   var state = null;
   var sans = [];          /* SAN strings shown in the move list */
-  var history = [];       /* { state, san, prevMove } — one entry per ply */
+  var history = [];       /* { state, san, prevMove, captured } — one entry per ply */
   var keys = [];          /* position keys, for threefold repetition */
   var hashes = [];        /* position hashes, handed to the AI for the same */
   var lastMove = null;
@@ -295,10 +295,25 @@
     return html;
   }
 
+  /* Pieces each side has lost, strongest first. Taken from the captures that
+     were actually played: counting what is missing from the board would show
+     a promoted pawn as a captured one. */
+  function lostPieces() {
+    var lost = { white: [], black: [] };
+    for (var i = 0; i < history.length; i++) {
+      var p = history[i].captured;
+      if (p) (C.colorOf(p) === WHITE ? lost.white : lost.black).push(C.typeOf(p));
+    }
+    var strongest = function (a, b) { return b - a; };
+    lost.white.sort(strongest);
+    lost.black.sort(strongest);
+    return lost;
+  }
+
   function renderPlayers() {
     var topSide = flipped ? WHITE : BLACK;
     var bottomSide = flipped ? BLACK : WHITE;
-    var cap = C.captured(state.board);
+    var cap = lostPieces();
     var edge = materialEdge();
 
     var rows = [
@@ -317,8 +332,8 @@
       /* a player's captures are the opponent's losses */
       r.captured.innerHTML = capturedHtml(r.side === WHITE ? cap.black : cap.white,
         r.side === WHITE ? BLACK : WHITE);
-      var adv = r.side === WHITE ? edge : -edge;
-      r.edgeEl.textContent = adv > 0 ? '+' + Math.round(adv / 100) : '';
+      var adv = Math.round((r.side === WHITE ? edge : -edge) / 100);
+      r.edgeEl.textContent = adv > 0 ? '+' + adv : '';
     }
   }
 
@@ -390,7 +405,10 @@
       cell.classList.toggle('hint', isHint);
       cell.classList.toggle('cap', isHint && !!target.captured);
 
-      cell.disabled = !interactive;
+      /* aria-disabled, not disabled: a disabled button drops keyboard focus,
+         which threw keyboard players off the board on every CPU turn.
+         Input is refused by inputAllowed() in the handlers instead. */
+      cell.setAttribute('aria-disabled', String(!interactive));
       cell.setAttribute('aria-label', C.describe(sq, state.board) +
         (isHint ? ' に移動できます' : ''));
 
@@ -483,7 +501,7 @@
         best: bestInfo && bestInfo.ply === history.length ? bestInfo : null
       };
     }
-    history.push({ state: state, san: san, prevMove: lastMove });
+    history.push({ state: state, san: san, prevMove: lastMove, captured: move.captured });
 
     var wasCapture = !!move.captured;
     state = C.makeMove(state, move);
@@ -514,24 +532,25 @@
     else coachKick();
   }
 
+  /* the entry of `list` that is the same move as `move` (from / to / promo) */
+  function findMove(list, move) {
+    for (var i = 0; i < list.length; i++) {
+      var lm = list[i];
+      if (lm.from === move.from && lm.to === move.to && lm.promo === move.promo) return lm;
+    }
+    return null;
+  }
+
   function scheduleCpu() {
     thinking = true;
     updateStatus();
     clearTimeout(aiTimer);
     aiTimer = null;
 
+    cancelEngine();
     var worker = ensureWorker();
     if (!worker) {
       /* no Worker here (notably file:// in some browsers): think inline */
-      aiTimer = setTimeout(function () {
-        aiTimer = null;
-        onCpuMove(C.chooseMove(state, level, hashes.slice()));
-      }, AI_THINK);
-      return;
-    }
-    cancelEngine();
-    worker = ensureWorker();
-    if (!worker) {
       aiTimer = setTimeout(function () {
         aiTimer = null;
         onCpuMove(C.chooseMove(state, level, hashes.slice()));
@@ -557,15 +576,7 @@
     aiTimer = null;
     thinking = false;
     if (!move || over || !isCpuTurn()) { refresh(); render(); return; }
-    var canonical = null;
-    var legal = statusNow.moves;
-    for (var i = 0; i < legal.length; i++) {
-      var lm = legal[i];
-      if (lm.from === move.from && lm.to === move.to && lm.promo === move.promo) {
-        canonical = lm;
-        break;
-      }
-    }
+    var canonical = findMove(statusNow.moves, move);
     if (!canonical) { render(); return; }
     applyMove(canonical);
   }
@@ -666,15 +677,7 @@
     /* a move was played (or undone) since the request: the hint was for another position */
     if (hintPly !== history.length) { render(); return; }
     if (!move || over || !humanTurn()) { render(); return; }
-    var canonical = null;
-    var legal = statusNow.moves;
-    for (var i = 0; i < legal.length; i++) {
-      var lm = legal[i];
-      if (lm.from === move.from && lm.to === move.to && lm.promo === move.promo) {
-        canonical = lm;
-        break;
-      }
-    }
+    var canonical = findMove(statusNow.moves, move);
     if (!canonical) { render(); return; }
     var san = C.moveToSan(state, canonical, statusNow.moves);
     bestInfo = {
@@ -819,11 +822,7 @@
       setTimeout(function () {
         if (!evalCtx || evalPly !== history.length) return;
         var st = C.fromFen(pre.fen);
-        var mv = null;
-        var ls = C.legalMoves(st);
-        for (var i = 0; i < ls.length; i++) {
-          if (ls[i].from === m.from && ls[i].to === m.to && ls[i].promo === m.promo) { mv = ls[i]; break; }
-        }
+        var mv = findMove(C.legalMoves(st), m);
         onCoachScore(mv ? C.scoreMove(st, mv, best.depth, pre.hashes, 1200) : null);
       }, 30);
       return;
@@ -928,7 +927,8 @@
     var line;
 
     if (statusNow.reason === 'checkmate') {
-      var winner = statusNow.result;
+      /* status() reports the winner as 'white' / 'black'; compare as a colour */
+      var winner = statusNow.result === 'white' ? WHITE : BLACK;
       if (mode === 'ai') {
         title = winner === humanSide ? 'あなたの勝ち！' : 'CPUの勝ち';
         text = winner === humanSide ? 'お見事です。' : '次は負けません。';
@@ -938,7 +938,7 @@
       }
       line = '<span class="num">' + sans.length + '</span> 手で決着';
     } else if (statusNow.reason === 'resign') {
-      var winner = statusNow.result === 'white' ? WHITE : BLACK;
+      winner = statusNow.result === 'white' ? WHITE : BLACK;
       if (mode === 'ai') {
         title = winner === humanSide ? 'あなたの勝ち！' : 'CPUの勝ち';
         text = winner === humanSide ? 'CPUが投了しました。' : '投了しました。お疲れさまでした。';
@@ -1216,7 +1216,7 @@
   el.hint.addEventListener('click', function () { requestHint(); });
   el.coach.addEventListener('change', function () { setCoach(el.coach.checked); });
   el.resign.addEventListener('click', resign);
-  el.fresh.addEventListener('click', newGame);
+  el.fresh.addEventListener('click', function () { if (confirmReset()) newGame(); });
   el.again.addEventListener('click', newGame);
 
   el.modes.forEach(function (btn) {
